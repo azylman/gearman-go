@@ -10,10 +10,10 @@ import (
 )
 
 const (
-	Unlimited = iota
-	OneByOne
+	Unlimited = 0
+	OneByOne  = 1
 
-	Immediately = iota
+	Immediately = 0
 )
 
 // Worker is the only structure needed by worker side developing.
