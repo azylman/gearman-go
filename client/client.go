@@ -3,7 +3,7 @@
 package client
 
 import (
-	"bufio"
+	"io"
 	"net"
 	"sync"
 )
@@ -18,7 +18,10 @@ type Client struct {
 	innerHandler        map[string]ResponseHandler
 	in                  chan *Response
 	conn                net.Conn
-	rw                  *bufio.ReadWriter
+	rw                  io.ReadWriter
+	openJobs            []ResponseHandler
+	jobLock             sync.Mutex
+	mapLock             sync.Mutex
 
 	ErrorHandler ErrorHandler
 }
@@ -28,16 +31,15 @@ func New(network, addr string) (client *Client, err error) {
 	client = &Client{
 		net:          network,
 		addr:         addr,
-		respHandler:  make(map[string]ResponseHandler, queueSize),
-		innerHandler: make(map[string]ResponseHandler, queueSize),
+		respHandler:  map[string]ResponseHandler{},
+		innerHandler: map[string]ResponseHandler{},
+		openJobs:     []ResponseHandler{},
 		in:           make(chan *Response, queueSize),
 	}
 	client.conn, err = net.Dial(client.net, client.addr)
 	if err != nil {
 		return
 	}
-	client.rw = bufio.NewReadWriter(bufio.NewReader(client.conn),
-		bufio.NewWriter(client.conn))
 	go client.readLoop()
 	go client.processLoop()
 	return
@@ -47,38 +49,40 @@ func (client *Client) write(req *request) (err error) {
 	var n int
 	buf := req.Encode()
 	for i := 0; i < len(buf); i += n {
-		n, err = client.rw.Write(buf[i:])
+		n, err = client.conn.Write(buf[i:])
 		if err != nil {
 			return
-		}
-	}
-	return client.rw.Flush()
-}
-
-func (client *Client) read(length int) (data []byte, err error) {
-	n := 0
-	buf := getBuffer(bufferSize)
-	// read until data can be unpacked
-	for i := length; i > 0 || len(data) < minPacketLength; i -= n {
-		if n, err = client.rw.Read(buf); err != nil {
-			return
-		}
-		data = append(data, buf[0:n]...)
-		if n < bufferSize {
-			break
 		}
 	}
 	return
 }
 
+func (client *Client) read(length int) ([]byte, error) {
+	data := []byte{}
+	read := 0
+	// read until data can be unpacked
+	for len(data) < minPacketLength && read < length {
+		buf := getBuffer(bufferSize)
+		n, err := client.conn.Read(buf)
+		if err != nil {
+			return nil, err
+		}
+		read += n
+		data = append(data, buf[:n]...)
+		if n < bufferSize {
+			break
+		}
+	}
+	return data, nil
+}
+
 func (client *Client) readLoop() {
 	defer close(client.in)
-	var data, leftdata []byte
-	var err error
-	var resp *Response
+	var leftdata []byte
 ReadLoop:
 	for client.conn != nil {
-		if data, err = client.read(bufferSize); err != nil {
+		data, err := client.read(bufferSize)
+		if err != nil {
 			if opErr, ok := err.(*net.OpError); ok {
 				if opErr.Timeout() {
 					client.err(err)
@@ -98,14 +102,15 @@ ReadLoop:
 				client.err(err)
 				break
 			}
-			client.rw = bufio.NewReadWriter(bufio.NewReader(client.conn),
-				bufio.NewWriter(client.conn))
+			client.conn = client.conn
 			continue
 		}
 		if len(leftdata) > 0 { // some data left for processing
 			data = append(leftdata, data...)
+			leftdata = []byte{}
 		}
 		for {
+			var resp *Response
 			l := len(data)
 			if l < minPacketLength { // not enough data
 				leftdata = data
@@ -139,7 +144,14 @@ func (client *Client) processLoop() {
 		case dtStatusRes:
 			resp = client.handleInner("s"+resp.Handle, resp)
 		case dtJobCreated:
-			resp = client.handleInner("c", resp)
+			client.jobLock.Lock()
+			if len(client.openJobs) == 0 {
+				panic("No open jobs!")
+			}
+			handler := client.openJobs[0]
+			client.openJobs = client.openJobs[1:]
+			client.jobLock.Unlock()
+			handler(resp)
 		case dtEchoRes:
 			resp = client.handleInner("e", resp)
 		case dtWorkData, dtWorkWarning, dtWorkStatus:
@@ -147,7 +159,9 @@ func (client *Client) processLoop() {
 		case dtWorkComplete, dtWorkFail, dtWorkException:
 			resp = client.handleResponse(resp.Handle, resp)
 			if resp != nil {
+				client.mapLock.Lock()
 				delete(client.respHandler, resp.Handle)
+				client.mapLock.Unlock()
 			}
 		}
 	}
@@ -183,15 +197,16 @@ func (client *Client) do(funcname string, data []byte,
 	}
 	var mutex sync.Mutex
 	mutex.Lock()
-	client.lastcall = "c"
-	client.innerHandler["c"] = func(resp *Response) {
+	client.jobLock.Lock()
+	client.openJobs = append(client.openJobs, func(resp *Response) {
 		defer mutex.Unlock()
 		if resp.DataType == dtError {
 			err = getError(resp.Data)
 			return
 		}
 		handle = resp.Handle
-	}
+	})
+	client.jobLock.Unlock()
 	id := IdGen.Id()
 	req := getJob(id, []byte(funcname), data)
 	req.DataType = flag
@@ -215,7 +230,9 @@ func (client *Client) Do(funcname string, data []byte,
 	}
 	handle, err = client.do(funcname, data, datatype)
 	if err == nil && h != nil {
+		client.mapLock.Lock()
 		client.respHandler[handle] = h
+		client.mapLock.Unlock()
 	}
 	return
 }
